@@ -1,5 +1,16 @@
 ## Unreleased
 
+### Added
+
+- `Compound::replace_part`, `Compound::add_part` and `Compound::remove_part` change a compound's
+  parts at runtime. Each call is atomic: the new part is validated first (the index must name an
+  existing part, nested composites are rejected, and a part whose parameters are not finite is
+  rejected), and only then are the leaf AABBs, the local AABB, the BVH and the FIX_INTERNAL_EDGES
+  pseudo-normals rebuilt together, so mass properties, bounding boxes and spatial queries always
+  observe one generation of the parts. A rejected call, returned as a
+  `CompoundModificationError`, leaves the whole compound -- and therefore any clone made from it
+  -- on the old generation.
+
 ### Modified
 
 - Deserializing a `ContactManifoldsWorkspace` that was serialized by a custom contact-manifolds

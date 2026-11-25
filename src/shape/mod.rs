@@ -19,7 +19,7 @@ pub use self::triangle::{Triangle, TriangleOrientation, TrianglePointLocation};
 #[cfg(feature = "alloc")]
 pub use self::{
     composite_shape::{CompositeShape, CompositeShapeRef, TypedCompositeShape},
-    compound::Compound,
+    compound::{Compound, CompoundModificationError},
     polyline::Polyline,
     shared_shape::SharedShape,
     voxels::{AxisMask, OctantPattern, VoxelData, VoxelState, VoxelType, Voxels, VoxelsChunkRef},

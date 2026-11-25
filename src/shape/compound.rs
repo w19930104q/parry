@@ -41,6 +41,21 @@ bitflags::bitflags! {
     }
 }
 
+/// Why an attempt to change a [`Compound`]'s parts was rejected.
+///
+/// A rejected change is atomic: the compound keeps every part, bounding volume and acceleration
+/// structure it had before the call.
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CompoundModificationError {
+    /// The index does not name one of the compound's parts.
+    PartNotFound,
+    /// The replacement was itself a composite shape; compounds cannot be nested.
+    NestedComposite,
+    /// The replacement's parameters are not finite, so its bounding volume cannot be built.
+    InvalidPart,
+}
+
 /// A compound shape with an aabb bounding volume.
 ///
 /// A compound shape is a shape composed of the union of several simpler shape. This is
@@ -55,6 +70,10 @@ pub struct Compound {
     aabb: Aabb,
     #[cfg_attr(feature = "serde", serde(default))]
     flags: CompoundFlags,
+    /// The tolerance the pseudo-normals were last computed with, so a runtime part replacement
+    /// rebuilds them the same way `set_flags` did. Only read while `FIX_INTERNAL_EDGES` is set.
+    #[cfg_attr(feature = "serde", serde(default))]
+    weld_tolerance: Real,
     /// `None` for a part that constrains nothing: one that is not polygonal, or any part at all
     /// while [`CompoundFlags::FIX_INTERNAL_EDGES`] is unset.
     #[cfg_attr(feature = "serde", serde(default))]
@@ -182,6 +201,7 @@ impl Compound {
             aabbs,
             aabb,
             flags: CompoundFlags::empty(),
+            weld_tolerance: Self::DEFAULT_WELD_TOLERANCE,
             pseudo_normals: None,
         }
     }
@@ -246,7 +266,8 @@ impl Compound {
         self.flags = flags;
 
         if flags.contains(CompoundFlags::FIX_INTERNAL_EDGES) {
-            self.compute_pseudo_normals(weld_tolerance.unwrap_or(Self::DEFAULT_WELD_TOLERANCE));
+            self.weld_tolerance = weld_tolerance.unwrap_or(Self::DEFAULT_WELD_TOLERANCE);
+            self.compute_pseudo_normals(self.weld_tolerance);
         } else {
             self.pseudo_normals = None;
         }
@@ -255,6 +276,125 @@ impl Compound {
     /// The [`CompoundFlags`] controlling this compound's optional associated data.
     pub fn flags(&self) -> CompoundFlags {
         self.flags
+    }
+
+    /// Replaces one part of the compound in place.
+    ///
+    /// The part currently stored at `index` is removed and `new_part` takes its place, keeping the
+    /// same index. Every piece of data derived from the parts -- the leaf AABBs, the compound's
+    /// local AABB and the BVH used by every spatial query -- is rebuilt in the same step, so mass
+    /// properties ([`MassProperties::from_compound`]), bounding boxes and query results can never
+    /// observe two different generations of the parts.
+    ///
+    /// The change is validated before anything is touched. If `index` is out of bounds, the new
+    /// part is itself a composite shape (nested composites are not allowed), or its parameters are
+    /// not finite (so its AABB cannot be built), the error is returned and the compound is left
+    /// exactly as it was, including all its bounding volumes.
+    ///
+    /// If [`CompoundFlags::FIX_INTERNAL_EDGES`] is set, the pseudo-normals are recomputed from the
+    /// new parts with the same weld tolerance as the previous computation.
+    ///
+    /// [`MassProperties::from_compound`]: crate::mass_properties::MassProperties::from_compound
+    pub fn replace_part(
+        &mut self,
+        index: u32,
+        new_part: (Pose, SharedShape),
+    ) -> Result<(), CompoundModificationError> {
+        if index as usize >= self.shapes.len() {
+            return Err(CompoundModificationError::PartNotFound);
+        }
+
+        if new_part.1.as_composite_shape().is_some() {
+            return Err(CompoundModificationError::NestedComposite);
+        }
+
+        let new_aabb = new_part.1.compute_aabb(&new_part.0);
+        if !aabb_is_finite(&new_aabb) {
+            return Err(CompoundModificationError::InvalidPart);
+        }
+
+        // The new part has been fully validated, so the swap and the rebuild below cannot fail:
+        // the compound moves from one complete generation straight to the next.
+        self.shapes[index as usize] = new_part;
+        self.aabbs[index as usize] = new_aabb;
+        self.rebuild_derived_volumes();
+
+        if self.flags.contains(CompoundFlags::FIX_INTERNAL_EDGES) {
+            self.compute_pseudo_normals(self.weld_tolerance);
+        }
+
+        Ok(())
+    }
+
+    /// Removes the part stored at `index`.
+    ///
+    /// As with [`Compound::replace_part`], the leaf AABBs, local AABB, BVH and, if set, the
+    /// pseudo-normals are rebuilt together, so no query can observe a half-updated compound.
+    ///
+    /// Removing the last remaining part would leave the compound empty, which is not allowed; that
+    /// call returns [`CompoundModificationError::PartNotFound`] (there is no valid one-part
+    /// compound left to remove from) and changes nothing.
+    pub fn remove_part(
+        &mut self,
+        index: u32,
+    ) -> Result<(Pose, SharedShape), CompoundModificationError> {
+        if index as usize >= self.shapes.len() || self.shapes.len() == 1 {
+            return Err(CompoundModificationError::PartNotFound);
+        }
+
+        let removed = self.shapes.remove(index as usize);
+        let _ = self.aabbs.remove(index as usize);
+        self.rebuild_derived_volumes();
+
+        if self.flags.contains(CompoundFlags::FIX_INTERNAL_EDGES) {
+            self.compute_pseudo_normals(self.weld_tolerance);
+        }
+
+        Ok(removed)
+    }
+
+    /// Appends a part to the compound.
+    ///
+    /// The new part becomes the last one, with the next available index. The leaf AABBs, local
+    /// AABB, BVH and, if set, the pseudo-normals are rebuilt in the same step, and a rejected part
+    /// (a nested composite, or one whose parameters are not finite) leaves the compound untouched.
+    pub fn add_part(
+        &mut self,
+        new_part: (Pose, SharedShape),
+    ) -> Result<u32, CompoundModificationError> {
+        if new_part.1.as_composite_shape().is_some() {
+            return Err(CompoundModificationError::NestedComposite);
+        }
+
+        let new_aabb = new_part.1.compute_aabb(&new_part.0);
+        if !aabb_is_finite(&new_aabb) {
+            return Err(CompoundModificationError::InvalidPart);
+        }
+
+        self.shapes.push(new_part);
+        self.aabbs.push(new_aabb);
+        self.rebuild_derived_volumes();
+
+        if self.flags.contains(CompoundFlags::FIX_INTERNAL_EDGES) {
+            self.compute_pseudo_normals(self.weld_tolerance);
+        }
+
+        Ok((self.shapes.len() - 1) as u32)
+    }
+
+    /// Rebuilds the local AABB and BVH from the current `shapes`/`aabbs`, which the callers keep
+    /// in sync themselves. The BVH keeps no dilation because this tree is rebuilt on every edit.
+    fn rebuild_derived_volumes(&mut self) {
+        let mut aabb = Aabb::new_invalid();
+        let mut leaves = Vec::with_capacity(self.aabbs.len());
+
+        for (i, leaf_aabb) in self.aabbs.iter().enumerate() {
+            aabb.merge(leaf_aabb);
+            leaves.push((i, *leaf_aabb));
+        }
+
+        self.bvh = Bvh::from_iter(BvhBuildStrategy::Binned, leaves);
+        self.aabb = aabb;
     }
 
     /// The parts' outlines in the compound's frame, wound counter-clockwise. `None` for a part
@@ -1313,6 +1453,30 @@ fn weld_corners(corners: &[Vector], tolerance: Real) -> Vec<u32> {
         .collect()
 }
 
+/// Whether every bound of an AABB is a finite number.
+///
+/// A part placed through a non-finite pose, or one whose own size is not finite, produces an AABB
+/// with a `NaN` or infinite bound. Such a part cannot take part in BVH construction or any spatial
+/// query, so a replacement carrying one is rejected before the compound is touched.
+fn aabb_is_finite(aabb: &Aabb) -> bool {
+    #[cfg(feature = "dim2")]
+    {
+        aabb.mins.x.is_finite()
+            && aabb.mins.y.is_finite()
+            && aabb.maxs.x.is_finite()
+            && aabb.maxs.y.is_finite()
+    }
+    #[cfg(feature = "dim3")]
+    {
+        aabb.mins.x.is_finite()
+            && aabb.mins.y.is_finite()
+            && aabb.mins.z.is_finite()
+            && aabb.maxs.x.is_finite()
+            && aabb.maxs.y.is_finite()
+            && aabb.maxs.z.is_finite()
+    }
+}
+
 /// The edges of a closed outline, as consecutive vertex-index pairs wrapping back to the start.
 #[cfg(feature = "dim2")]
 fn outline_edge_ids(ids: &[u32]) -> impl Iterator<Item = (u32, u32)> + '_ {
@@ -1793,6 +1957,517 @@ mod test {
             expected[0]
         );
         assert_eq!(normals_against_the_wedge(&fixed, 0.01), expected);
+    }
+}
+
+#[cfg(test)]
+#[cfg(all(feature = "dim2", feature = "alloc", feature = "std"))]
+mod replacement_test {
+    use super::{Compound, CompoundModificationError};
+    use crate::bounding_volume::BoundingVolume;
+    use crate::mass_properties::MassProperties;
+    use crate::math::{Pose, Real, Vector};
+    use crate::query::{PointQuery, Ray, RayCast};
+    use crate::shape::{Cuboid, SharedShape};
+    use alloc::vec;
+
+    /// An L built from three unit squares: a two-box arm along the X axis and a one-box riser.
+    fn ell_compound() -> Compound {
+        let part = |center: [Real; 2]| {
+            (
+                Pose::translation(center[0], center[1]),
+                SharedShape::new(Cuboid::new(Vector::new(0.5, 0.5))),
+            )
+        };
+
+        Compound::new(vec![part([0.0, 0.0]), part([1.0, 0.0]), part([0.0, 1.0])])
+    }
+
+    fn ell_shapes() -> Vec<(Pose, SharedShape)> {
+        let part = |center: [Real; 2]| {
+            (
+                Pose::translation(center[0], center[1]),
+                SharedShape::new(Cuboid::new(Vector::new(0.5, 0.5))),
+            )
+        };
+
+        vec![part([0.0, 0.0]), part([1.0, 0.0]), part([0.0, 1.0])]
+    }
+
+    /// Asserts the compound's parts are exactly `expected`, comparing the fields that can be
+    /// compared: `SharedShape` itself does not implement `PartialEq`.
+    fn assert_parts_are(compound: &Compound, expected: &[(Pose, SharedShape)]) {
+        assert_eq!(compound.shapes().len(), expected.len());
+        for (actual, expected) in compound.shapes().iter().zip(expected) {
+            assert_eq!(actual.0.translation, expected.0.translation);
+            assert_eq!(
+                actual.1.as_cuboid().unwrap().half_extents,
+                expected.1.as_cuboid().unwrap().half_extents
+            );
+        }
+    }
+
+    #[test]
+    fn a_valid_replacement_moves_every_derived_result_together() {
+        let density = 2.5;
+        let mut compound = ell_compound();
+
+        let before = MassProperties::from_compound(density, compound.shapes());
+
+        // Replace the end of the horizontal arm with a box reaching twice as far.
+        let replacement = (
+            Pose::translation(2.0, 0.0),
+            SharedShape::new(Cuboid::new(Vector::new(0.5, 0.5))),
+        );
+        compound.replace_part(1, replacement).unwrap();
+
+        // The parts, the merged AABB and the BVH all describe the new generation at once.
+        assert_eq!(compound.shapes().len(), 3);
+        assert_eq!(compound.shapes()[1].0.translation, Vector::new(2.0, 0.0));
+        assert_eq!(compound.aabbs()[1].maxs.x, 2.5);
+        assert_eq!(compound.local_aabb().maxs.x, 2.5);
+        assert_eq!(compound.bvh().root_aabb().maxs.x, 2.5);
+
+        // Mass, center of mass and inertia move with the same replacement.
+        let after = MassProperties::from_compound(density, compound.shapes());
+        assert_ne!(after, before);
+        assert!(after.local_com.x > before.local_com.x);
+
+        // The old box's end is no longer covered, while a ray still finds the moved one.
+        let old_end = Vector::new(1.25, 0.0);
+        assert!(!compound.project_local_point(old_end, true).is_inside);
+        let ray = Ray::new(Vector::new(2.0, 5.0), -Vector::Y);
+        let hit = compound.cast_local_ray(&ray, Real::MAX, true).unwrap();
+        assert!((hit - 4.5).abs() < 1.0e-6, "hit the old box at {hit}");
+
+        // The update is indistinguishable from building the same shape from scratch.
+        let rebuilt = Compound::new(compound.shapes().to_vec());
+        assert_eq!(compound.aabbs(), rebuilt.aabbs());
+        assert_eq!(compound.local_aabb(), rebuilt.local_aabb());
+        assert_eq!(
+            MassProperties::from_compound(density, compound.shapes()),
+            MassProperties::from_compound(density, rebuilt.shapes())
+        );
+    }
+
+    #[test]
+    fn an_invalid_replacement_keeps_the_whole_old_compound() {
+        let density = 1.0;
+        let original = Compound::new(ell_shapes());
+        let mut compound = Compound::new(ell_shapes());
+        let snapshot_aabb = *compound.local_aabb();
+        let snapshot_props = MassProperties::from_compound(density, compound.shapes());
+
+        // A part whose size is NaN has no finite bounding volume.
+        let invalid = (
+            Pose::translation(1.0, 0.0),
+            SharedShape::new(Cuboid::new(Vector::new(Real::NAN, 0.5))),
+        );
+        assert_eq!(
+            compound.replace_part(1, invalid),
+            Err(CompoundModificationError::InvalidPart)
+        );
+
+        // Nothing moved: parts, leaf boxes, merged box and mass properties are all the old
+        // generation.
+        assert_parts_are(&compound, &original.shapes().to_vec());
+        assert_eq!(compound.aabbs(), original.aabbs());
+        assert_eq!(*compound.local_aabb(), snapshot_aabb);
+        assert_eq!(
+            MassProperties::from_compound(density, compound.shapes()),
+            snapshot_props
+        );
+
+        // An out-of-range index and a nested compound are rejected without touching anything.
+        let good = (
+            Pose::translation(1.0, 0.0),
+            SharedShape::new(Cuboid::new(Vector::new(0.5, 0.5))),
+        );
+        assert_eq!(
+            compound.replace_part(3, good.clone()),
+            Err(CompoundModificationError::PartNotFound)
+        );
+        let nested = (Pose::IDENTITY, SharedShape::new(Compound::new(vec![good])));
+        assert_eq!(
+            compound.replace_part(0, nested),
+            Err(CompoundModificationError::NestedComposite)
+        );
+        assert_eq!(*compound.local_aabb(), *original.local_aabb());
+    }
+
+    #[test]
+    fn a_rejected_replacement_is_not_inherited_by_a_clone() {
+        let mut compound = ell_compound();
+
+        let invalid = (
+            Pose::translation(1.0, 0.0),
+            SharedShape::new(Cuboid::new(Vector::new(0.5, Real::INFINITY))),
+        );
+        assert!(compound.replace_part(1, invalid).is_err());
+
+        // The clone predates any successful replacement, so it is the old generation in full.
+        let cloned = compound.clone();
+        assert_eq!(cloned.shapes()[1].0.translation, Vector::new(1.0, 0.0));
+        assert_eq!(*cloned.local_aabb(), *compound.local_aabb());
+
+        // A replacement that lands afterwards must not leak into the clone.
+        let replacement = (
+            Pose::translation(2.0, 0.0),
+            SharedShape::new(Cuboid::new(Vector::new(0.5, 0.5))),
+        );
+        compound.replace_part(1, replacement).unwrap();
+        assert_eq!(cloned.shapes()[1].0.translation, Vector::new(1.0, 0.0));
+        assert_eq!(cloned.local_aabb().maxs.x, 1.5);
+        assert_eq!(compound.local_aabb().maxs.x, 2.5);
+    }
+
+    #[test]
+    fn add_and_remove_keep_the_parts_and_volumes_in_lockstep() {
+        let mut compound = ell_compound();
+
+        let added = (
+            Pose::translation(1.0, 1.0),
+            SharedShape::new(Cuboid::new(Vector::new(0.5, 0.5))),
+        );
+        let index = compound.add_part(added).unwrap();
+        assert_eq!(index, 3);
+        assert_eq!(compound.shapes().len(), 4);
+        assert_eq!(compound.aabbs().len(), 4);
+        assert!(compound.local_aabb().contains(&compound.aabbs()[3]));
+        assert_eq!(compound.bvh().leaf_count(), 4);
+
+        compound.remove_part(index).unwrap();
+        assert_eq!(compound.shapes().len(), 3);
+        assert_eq!(compound.aabbs().len(), 3);
+        assert_eq!(compound.bvh().leaf_count(), 3);
+
+        // The last part cannot be removed: an empty compound is not allowed.
+        let mut single = Compound::new(vec![(
+            Pose::IDENTITY,
+            SharedShape::new(Cuboid::new(Vector::new(0.5, 0.5))),
+        )]);
+        assert_eq!(
+            single.remove_part(0).unwrap_err(),
+            CompoundModificationError::PartNotFound
+        );
+        assert_eq!(single.shapes().len(), 1);
+    }
+}
+
+#[cfg(test)]
+#[cfg(all(feature = "dim3", feature = "alloc", feature = "std"))]
+mod replacement_test {
+    use super::{Compound, CompoundModificationError};
+    use crate::bounding_volume::BoundingVolume;
+    use crate::mass_properties::MassProperties;
+    use crate::math::{Pose, Real, Vector};
+    use crate::query::{PointQuery, Ray, RayCast};
+    use crate::shape::{Cuboid, SharedShape};
+    use alloc::vec;
+
+    /// An L built from three unit cuboids: a two-box arm along the X axis and a one-box riser.
+    fn ell_compound() -> Compound {
+        let part = |center: [Real; 3]| {
+            (
+                Pose::translation(center[0], center[1], center[2]),
+                SharedShape::new(Cuboid::new(Vector::new(0.5, 0.5, 0.5))),
+            )
+        };
+
+        Compound::new(vec![
+            part([0.0, 0.0, 0.0]),
+            part([1.0, 0.0, 0.0]),
+            part([0.0, 1.0, 0.0]),
+        ])
+    }
+
+    fn ell_shapes() -> Vec<(Pose, SharedShape)> {
+        let part = |center: [Real; 3]| {
+            (
+                Pose::translation(center[0], center[1], center[2]),
+                SharedShape::new(Cuboid::new(Vector::new(0.5, 0.5, 0.5))),
+            )
+        };
+
+        vec![
+            part([0.0, 0.0, 0.0]),
+            part([1.0, 0.0, 0.0]),
+            part([0.0, 1.0, 0.0]),
+        ]
+    }
+
+    /// Everything derived from the parts, compared for two compounds that must be the same
+    /// generation: the parts themselves, every leaf AABB, the merged AABB, the mass properties and
+    /// a point query routed through the BVH.
+    fn assert_same_generation(left: &Compound, right: &Compound, density: Real) {
+        assert_eq!(left.shapes().len(), right.shapes().len());
+        for (l, r) in left.shapes().iter().zip(right.shapes()) {
+            assert_eq!(l.0.translation, r.0.translation);
+            assert_eq!(
+                l.1.as_cuboid().unwrap().half_extents,
+                r.1.as_cuboid().unwrap().half_extents
+            );
+        }
+
+        assert_eq!(left.aabbs(), right.aabbs());
+        assert_eq!(left.local_aabb(), right.local_aabb());
+        assert_eq!(left.bvh().root_aabb(), right.bvh().root_aabb());
+
+        let left_props = MassProperties::from_compound(density, left.shapes());
+        let right_props = MassProperties::from_compound(density, right.shapes());
+        assert_eq!(left_props, right_props);
+
+        let probe = Vector::new(1.0, 1.0, 5.0);
+        let left_projection = left.project_local_point(probe, true);
+        let right_projection = right.project_local_point(probe, true);
+        assert_eq!(left_projection.is_inside, right_projection.is_inside);
+        assert_eq!(left_projection.point, right_projection.point);
+    }
+
+    /// Asserts the compound's parts are exactly `expected`, comparing the fields that can be
+    /// compared: `SharedShape` itself does not implement `PartialEq`.
+    fn assert_parts_are(compound: &Compound, expected: &[(Pose, SharedShape)]) {
+        assert_eq!(compound.shapes().len(), expected.len());
+        for (actual, expected) in compound.shapes().iter().zip(expected) {
+            assert_eq!(actual.0.translation, expected.0.translation);
+            assert_eq!(
+                actual.1.as_cuboid().unwrap().half_extents,
+                expected.1.as_cuboid().unwrap().half_extents
+            );
+        }
+    }
+
+    #[test]
+    fn a_valid_replacement_moves_every_derived_result_together() {
+        let density = 2.5;
+        let mut compound = ell_compound();
+
+        let before = MassProperties::from_compound(density, compound.shapes());
+        let before_aabb = *compound.local_aabb();
+
+        // Replace the end of the horizontal arm with a box reaching twice as far.
+        let replacement = (
+            Pose::translation(2.0, 0.0, 0.0),
+            SharedShape::new(Cuboid::new(Vector::new(0.5, 0.5, 0.5))),
+        );
+        compound.replace_part(1, replacement).unwrap();
+
+        // The parts, the merged AABB and the BVH all describe the new generation at once.
+        assert_eq!(compound.shapes().len(), 3);
+        assert_eq!(
+            compound.shapes()[1].0.translation,
+            Vector::new(2.0, 0.0, 0.0)
+        );
+        assert_eq!(compound.aabbs().len(), 3);
+        assert_eq!(compound.aabbs()[1].maxs.x, 2.5);
+        assert_eq!(compound.local_aabb().maxs.x, 2.5);
+        assert_eq!(compound.bvh().root_aabb().maxs.x, 2.5);
+        assert_ne!(*compound.local_aabb(), before_aabb);
+
+        // Mass, center of mass and inertia move with the same replacement.
+        let after = MassProperties::from_compound(density, compound.shapes());
+        assert_ne!(after, before);
+        assert!(after.local_com.x > before.local_com.x);
+
+        // A point only the old box covered now lies outside, and a ray fired at the arm reaches the
+        // new box's far face instead of the old one's: the queries see the new parts.
+        let old_end = Vector::new(1.25, 0.0, 0.0);
+        assert!(!compound.project_local_point(old_end, true).is_inside);
+        let ray = Ray::new(Vector::new(2.0, 0.0, 5.0), -Vector::Z);
+        let hit = compound.cast_local_ray(&ray, Real::MAX, true).unwrap();
+        assert!((hit - 4.5).abs() < 1.0e-6, "hit the old box at {hit}");
+
+        // Rebuilding the same shape from scratch must reproduce every derived result bit for bit,
+        // which is what makes the update indistinguishable from a fresh construction.
+        let rebuilt = Compound::new(compound.shapes().to_vec());
+        assert_same_generation(&compound, &rebuilt, density);
+    }
+
+    #[test]
+    fn an_invalid_replacement_keeps_the_whole_old_compound() {
+        let density = 1.0;
+        let original = Compound::new(ell_shapes());
+        let mut compound = Compound::new(ell_shapes());
+        let snapshot = (
+            compound.shapes().to_vec(),
+            compound.aabbs().to_vec(),
+            *compound.local_aabb(),
+            MassProperties::from_compound(density, compound.shapes()),
+        );
+
+        // A part whose size is NaN has no finite bounding volume.
+        let invalid = (
+            Pose::translation(1.0, 0.0, 0.0),
+            SharedShape::new(Cuboid::new(Vector::new(Real::NAN, 0.5, 0.5))),
+        );
+        assert_eq!(
+            compound.replace_part(1, invalid),
+            Err(CompoundModificationError::InvalidPart)
+        );
+
+        // Nothing moved: parts, leaf boxes, merged box and mass properties are all the old
+        // generation, and a fresh compound of the original parts agrees with every one of them.
+        assert_parts_are(&compound, &snapshot.0);
+        assert_eq!(compound.aabbs(), snapshot.1.as_slice());
+        assert_eq!(*compound.local_aabb(), snapshot.2);
+        assert_eq!(
+            MassProperties::from_compound(density, compound.shapes()),
+            snapshot.3
+        );
+        assert_same_generation(&compound, &original, density);
+
+        // An out-of-range index is rejected the same way.
+        let good = (
+            Pose::translation(1.0, 0.0, 0.0),
+            SharedShape::new(Cuboid::new(Vector::new(0.5, 0.5, 0.5))),
+        );
+        assert_eq!(
+            compound.replace_part(3, good.clone()),
+            Err(CompoundModificationError::PartNotFound)
+        );
+        assert_same_generation(&compound, &original, density);
+
+        // A nested compound is rejected too.
+        let nested = (Pose::IDENTITY, SharedShape::new(Compound::new(vec![good])));
+        assert_eq!(
+            compound.replace_part(0, nested),
+            Err(CompoundModificationError::NestedComposite)
+        );
+        assert_same_generation(&compound, &original, density);
+    }
+
+    #[test]
+    fn a_rejected_replacement_is_not_inherited_by_a_clone() {
+        let mut compound = ell_compound();
+
+        let invalid = (
+            Pose::translation(1.0, 0.0, 0.0),
+            SharedShape::new(Cuboid::new(Vector::new(0.5, Real::INFINITY, 0.5))),
+        );
+        assert!(compound.replace_part(1, invalid).is_err());
+
+        // The clone predates any successful replacement, so it is the old generation in full.
+        let cloned = compound.clone();
+        assert_eq!(cloned.shapes().len(), 3);
+        assert_eq!(cloned.shapes()[1].0.translation, Vector::new(1.0, 0.0, 0.0));
+        assert_eq!(*cloned.local_aabb(), *compound.local_aabb());
+        assert_eq!(cloned.aabbs(), compound.aabbs());
+
+        // And a replacement that lands on the original afterwards must not leak into the clone:
+        // the clone's results stay on the old generation while only the original moves on.
+        let replacement = (
+            Pose::translation(2.0, 0.0, 0.0),
+            SharedShape::new(Cuboid::new(Vector::new(0.5, 0.5, 0.5))),
+        );
+        compound.replace_part(1, replacement).unwrap();
+        assert_eq!(cloned.shapes()[1].0.translation, Vector::new(1.0, 0.0, 0.0));
+        assert_eq!(cloned.local_aabb().maxs.x, 1.5);
+        assert_eq!(compound.local_aabb().maxs.x, 2.5);
+    }
+
+    #[test]
+    fn add_and_remove_keep_the_parts_and_volumes_in_lockstep() {
+        let mut compound = ell_compound();
+
+        let added = (
+            Pose::translation(1.0, 1.0, 0.0),
+            SharedShape::new(Cuboid::new(Vector::new(0.5, 0.5, 0.5))),
+        );
+        let index = compound.add_part(added).unwrap();
+        assert_eq!(index, 3);
+        assert_eq!(compound.shapes().len(), 4);
+        assert_eq!(compound.aabbs().len(), 4);
+        assert!(compound.local_aabb().contains(&compound.aabbs()[3]));
+        assert_eq!(compound.bvh().leaf_count(), 4);
+
+        let rebuilt = Compound::new(compound.shapes().to_vec());
+        assert_same_generation(&compound, &rebuilt, 1.0);
+
+        let removed = compound.remove_part(index).unwrap();
+        assert_eq!(removed.0.translation, Vector::new(1.0, 1.0, 0.0));
+        assert_eq!(compound.shapes().len(), 3);
+        assert_eq!(compound.aabbs().len(), 3);
+        assert_eq!(compound.bvh().leaf_count(), 3);
+
+        let rebuilt = Compound::new(compound.shapes().to_vec());
+        assert_same_generation(&compound, &rebuilt, 1.0);
+
+        // The last part cannot be removed: an empty compound is not allowed.
+        let mut single = Compound::new(vec![(
+            Pose::IDENTITY,
+            SharedShape::new(Cuboid::new(Vector::new(0.5, 0.5, 0.5))),
+        )]);
+        assert_eq!(
+            single.remove_part(0).unwrap_err(),
+            CompoundModificationError::PartNotFound
+        );
+        assert_eq!(single.shapes().len(), 1);
+    }
+
+    #[test]
+    fn replacing_a_part_recomputes_the_pseudo_normals_together_with_the_volumes() {
+        use super::CompoundFlags;
+
+        let mut compound = ell_compound();
+        compound.set_flags(CompoundFlags::FIX_INTERNAL_EDGES, None);
+        assert!(compound.part_normal_constraints(0).is_some());
+
+        // Move a part so the seam it shared with its neighbour opens up. The pseudo-normals must
+        // describe the same generation as the new AABBs rather than the old adjacency.
+        let replacement = (
+            Pose::translation(3.0, 0.0, 0.0),
+            SharedShape::new(Cuboid::new(Vector::new(0.5, 0.5, 0.5))),
+        );
+        compound.replace_part(1, replacement).unwrap();
+
+        assert!(compound.part_normal_constraints(1).is_some());
+        assert_eq!(compound.local_aabb().maxs.x, 3.5);
+        assert_eq!(compound.bvh().root_aabb().maxs.x, 3.5);
+    }
+
+    #[test]
+    fn replacing_a_part_keeps_the_weld_tolerance_set_flags_was_given() {
+        use super::CompoundFlags;
+
+        // Two boxes whose seam only a non-zero tolerance welds, after a small rotation: the
+        // replacement reproduces the same setup, so recomputing with the stored tolerance must find
+        // the same seam rather than silently falling back to the default.
+        let rotated_parts = |gap: Real| {
+            let rotation = crate::math::Rotation::from_rotation_z(0.1);
+            let part = |center: Vector| {
+                (
+                    Pose::from_parts(rotation * center, rotation),
+                    SharedShape::new(Cuboid::new(Vector::new(0.5, 0.5, 0.5))),
+                )
+            };
+
+            vec![
+                part(Vector::new(0.0, 0.0, 0.0)),
+                part(Vector::new(1.0 + gap, 0.0, 0.0)),
+            ]
+        };
+
+        let mut compound = Compound::new(rotated_parts(0.0));
+        compound.set_flags(CompoundFlags::FIX_INTERNAL_EDGES, Some(0.0));
+        let exact_before = compound
+            .part_normal_constraints(0)
+            .unwrap()
+            .boundary_faces
+            .len();
+
+        compound
+            .replace_part(1, rotated_parts(0.0).into_iter().nth(1).unwrap())
+            .unwrap();
+
+        // Stored tolerance zero means the recomputation is still exact, keeping the same faces.
+        assert_eq!(
+            compound
+                .part_normal_constraints(0)
+                .unwrap()
+                .boundary_faces
+                .len(),
+            exact_before
+        );
     }
 }
 
